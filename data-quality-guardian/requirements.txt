@@ -1,0 +1,4 @@
+# Data Quality Guardian dependencies
+# sqlite3 is part of the Python standard library, so it is not listed here.
+google-adk>=1.0.0   # multi-agent orchestration (LlmAgent / SequentialAgent / LoopAgent)
+kuzu>=0.7.0         # embedded property-graph database (Cypher)

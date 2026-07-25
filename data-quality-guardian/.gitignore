@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+# generated at runtime
+shop.db
+shop_graph
+shop_graph.wal
+.venv/
+venv/
+
+
