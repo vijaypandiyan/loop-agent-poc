@@ -47,7 +47,57 @@ export GEMINI_API_KEY="your-key-here"
 python main.py
 ```
 
-Optional: `export ADK_MODEL=gemini-2.0-flash` to pick a different Gemini model.
+### Using DeepSeek / Qwen instead of Gemini (build.nvidia.com)
+
+Nothing in the agents is Gemini-specific. ADK reaches non-Google models through
+[LiteLLM](https://docs.litellm.ai/), and `https://build.nvidia.com` exposes an OpenAI-compatible
+endpoint, so switching providers is purely environment variables (see `config.py`):
+
+```bash
+export MODEL_PROVIDER=nvidia
+export NVIDIA_API_KEY="nvapi-..."                 # from https://build.nvidia.com
+export ADK_MODEL="qwen/qwen3-next-80b-a3b-instruct"   # or meta/llama-3.3-70b-instruct
+python check_model.py    # verifies the endpoint + that the model id really exists
+python main.py
+```
+
+Prefer a file over exports? Copy `.env.example` to `.env` next to `config.py` — it is loaded
+automatically:
+
+```ini
+MODEL_PROVIDER=nvidia
+NVIDIA_API_KEY=nvapi-your-key-here
+ADK_MODEL=qwen/qwen3-next-80b-a3b-instruct
+```
+
+If you see `GEMINI_API_KEY is not set`, `MODEL_PROVIDER` simply never reached the process — it is
+read from the environment / `.env`, not hard-coded. (You can also change `DEFAULT_PROVIDER` in
+`config.py` to `"nvidia"` to make NVIDIA the default with no env var at all.)
+
+Any other OpenAI-compatible server (vLLM, Ollama, Together, …) works too:
+
+```bash
+export MODEL_PROVIDER=openai_compatible
+export OPENAI_API_BASE=http://localhost:8000/v1
+export OPENAI_API_KEY=sk-...
+export ADK_MODEL=qwen2.5-72b-instruct
+```
+
+#### Troubleshooting
+
+| Symptom | Cause / fix |
+|---|---|
+| `ServiceUnavailableError ... 503 ResourceExhausted: Worker local total request limit reached` | The hosted model is out of capacity right now — nothing wrong with your key or code. The client already retries (`LLM_RETRIES`, default 5); if it persists switch models or set `ADK_FALLBACK_MODELS="meta/llama-3.3-70b-instruct,nvidia/llama-3.3-nemotron-super-49b-v1.5"` to fail over automatically. |
+| `NotFoundError: 404 page not found` (plain text, not JSON) | The **base URL** is wrong — it must end with `/v1` (`https://integrate.api.nvidia.com/v1`). Run `python check_model.py`. |
+| `404 {"detail": "model not found"}` | The **model id** doesn't exist on that endpoint. Model ids change often (e.g. there is no `deepseek-ai/deepseek-v3.1` on build.nvidia.com — it lists `deepseek-ai/deepseek-v4-flash` / `-v4-pro`). `python check_model.py` prints the live list. |
+| `GEMINI_API_KEY is not set` while using NVIDIA | `MODEL_PROVIDER` didn't reach the process — put it in `.env` or `export` it. |
+| `401 / invalid api key` | Key belongs to a different provider, or was pasted with a trailing space. |
+| Agents talk about fixes but nothing changes | The chosen model does not support tool calling — switch models. |
+
+> **Pick a model that supports tool / function calling.** All four agents call tools; a model
+> without function-calling support will describe what it *would* do instead of doing it.
+> Known-good on NVIDIA: `qwen/qwen3-next-80b-a3b-instruct`, `meta/llama-3.3-70b-instruct`,
+> `nvidia/llama-3.3-nemotron-super-49b-v1.5`. Under Gemini use `gemini-2.0-flash` or newer.
 
 Each module also runs standalone, which is the easiest way to explore it:
 
@@ -187,17 +237,32 @@ STEP 3  issues before the agents run
 ========================================================================
 ITERATION 1
 ========================================================================
+
+  --- BEFORE this iteration: 4 issue(s) ---
+      orphan_order:103             Order 103 references a customer that does not exist ...
+      orphan_order_item:1004       order_item 1004 references missing product 77 ...
+      negative_stock:13            Product 13 has negative stock (-4).
+      price_mismatch:1005          order_item 1005 unit_price 12.0 != product price 45.5.
   [detector_agent] -> tool detect_issues({})
-  [detector_agent] <- detect_issues returned {'count': 4, ...}
   [planner_agent] [{"step": 1, "issue_type": "orphan_order", "primary_key": 103, ...}, ...]
-  [fixer_agent] -> tool apply_fix({'issue_type': 'orphan_order', 'primary_key': 103})
-  [fixer_agent] -> tool apply_fix({'issue_type': 'orphan_order_item', 'primary_key': 1004})
   [fixer_agent] -> tool apply_fix({'issue_type': 'negative_stock', 'primary_key': 13})
-  [fixer_agent] -> tool apply_fix({'issue_type': 'price_mismatch', 'primary_key': 1005})
+  [fixer_agent] <- apply_fix negative_stock:13  (1 row(s) changed)
+                 sql   : UPDATE products SET stock = 0 WHERE id = 13
+                 before: [{'id': 13, 'name': 'Laptop Stand', 'price': 39.0, 'stock': -4}]
+                 after : [{'id': 13, 'name': 'Laptop Stand', 'price': 39.0, 'stock': 0}]
+                 issues: 2 -> 1
   [validator_agent] -> tool count_issues({})
   [validator_agent] <- count_issues returned {'remaining': 0, 'clean': True}
 
   *** escalate raised by validator_agent - breaking the loop ***
+
+  --- AFTER this iteration: 0 issue(s) ---
+      (none)
+  --- iteration delta: 4 resolved, 0 newly exposed ---
+      RESOLVED  negative_stock:13
+      RESOLVED  orphan_order:103
+      RESOLVED  orphan_order_item:1004
+      RESOLVED  price_mismatch:1005
 
 ========================================================================
 LOOP FINISHED
@@ -227,7 +292,9 @@ vary is the final verification: it is plain SQL, and it must print zero.
 
 | Path | What it teaches |
 |---|---|
-| `config.py` | shared paths + model name |
+| `.env.example` | template for `MODEL_PROVIDER` / API keys (copy to `.env`) |
+| `check_model.py` | preflight: is the endpoint reachable and the model id real? |
+| `config.py` | shared paths + pluggable model provider (Gemini / NVIDIA / OpenAI-compatible) |
 | `db/seed_sqlite.py` | idempotent seed with 4 intentional defects |
 | `graph/build_kuzu.py` | graph modelling + `sync_from_sqlite()` |
 | `tools/quality_tools.py` | `detect_issues` / `count_issues` / `apply_fix` as ADK `FunctionTool`s |

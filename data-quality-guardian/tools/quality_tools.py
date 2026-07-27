@@ -183,6 +183,30 @@ def count_issues(tool_context: Any = None) -> dict[str, Any]:
     return {"remaining": remaining, "clean": clean}
 
 
+# Which row an issue points at, so we can photograph it before and after the fix.
+_ROW_LOOKUP = {
+    "orphan_order": (
+        "SELECT * FROM orders WHERE id = ?",
+        "SELECT * FROM order_items WHERE order_id = ?",
+    ),
+    "orphan_order_item": ("SELECT * FROM order_items WHERE id = ?", None),
+    "negative_stock": ("SELECT * FROM products WHERE id = ?", None),
+    "price_mismatch": ("SELECT * FROM order_items WHERE id = ?", None),
+}
+
+
+def _snapshot(conn: sqlite3.Connection, issue_type: str, primary_key: int) -> list[dict[str, Any]]:
+    """Return the row(s) an issue refers to, as plain dicts (empty list if gone)."""
+    queries = _ROW_LOOKUP.get(issue_type)
+    if not queries:
+        return []
+    rows: list[dict[str, Any]] = []
+    for sql in queries:
+        if sql:
+            rows.extend(dict(r) for r in conn.execute(sql, (primary_key,)))
+    return rows
+
+
 def apply_fix(issue_type: str, primary_key: int) -> dict[str, Any]:
     """Repair exactly one detected issue in SQLite, then re-sync the graph.
 
@@ -193,11 +217,14 @@ def apply_fix(issue_type: str, primary_key: int) -> dict[str, Any]:
         primary_key: the ``primary_key`` field of that same issue.
 
     Returns:
-        A dict with ``status`` (fixed | error), the SQL that ran and how many
-        rows changed.
+        A dict with ``status`` (fixed | error), the SQL that ran, how many rows
+        changed, and a ``before`` / ``after`` photograph of the affected row(s)
+        so the repair can be audited.
     """
     conn = _sqlite()
     statements: list[str] = []
+    before = _snapshot(conn, issue_type, primary_key)
+    issues_before = detect_issues()["count"]
     try:
         if issue_type == "orphan_order":
             # Remove the children first, then the order itself.
@@ -229,6 +256,7 @@ def apply_fix(issue_type: str, primary_key: int) -> dict[str, Any]:
 
         changed = conn.total_changes
         conn.commit()
+        after = _snapshot(conn, issue_type, primary_key)
     finally:
         conn.close()
 
@@ -241,6 +269,10 @@ def apply_fix(issue_type: str, primary_key: int) -> dict[str, Any]:
         "primary_key": primary_key,
         "sql": statements,
         "rows_changed": changed,
+        "before": before or "(row absent)",
+        "after": after or "(row deleted)",
+        "issues_before": issues_before,
+        "issues_after": detect_issues()["count"],
     }
 
 

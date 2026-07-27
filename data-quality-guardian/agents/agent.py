@@ -28,8 +28,12 @@ from google.adk.tools import FunctionTool
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from config import MODEL  # noqa: E402
+from config import build_model  # noqa: E402
 from tools.quality_tools import apply_fix, count_issues, detect_issues  # noqa: E402
+
+# One model object shared by all four agents: a Gemini model name, or a LiteLlm
+# wrapper around DeepSeek / Qwen / any OpenAI-compatible endpoint (see config.py).
+MODEL = build_model()
 
 # ADK reads the signature + docstring of each function to build the tool schema.
 detect_issues_tool = FunctionTool(func=detect_issues)

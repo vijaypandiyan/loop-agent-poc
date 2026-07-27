@@ -11,7 +11,6 @@ What happens, in order:
 """
 
 import asyncio
-import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -22,8 +21,8 @@ from google.genai import types
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from agents.agent import root_agent
-from config import KUZU_PATH, SQLITE_PATH
+import config
+from config import KUZU_PATH, SQLITE_PATH, describe_model, missing_credentials
 from db.seed_sqlite import seed
 from graph.build_kuzu import sync_from_sqlite
 from tools.quality_tools import detect_issues
@@ -64,7 +63,53 @@ def verify_sqlite() -> int:
     return total
 
 
+def issue_key(issue: dict) -> str:
+    return f"{issue['issue_type']}:{issue['primary_key']}"
+
+
+def print_state(label: str, issues: list[dict]) -> None:
+    """Print the outstanding issues at a point in time."""
+    print(f"\n  --- {label}: {len(issues)} issue(s) ---")
+    for issue in issues:
+        print(f"      {issue_key(issue):<28} {issue['description']}")
+    if not issues:
+        print("      (none)")
+
+
+def print_diff(before: list[dict], after: list[dict]) -> None:
+    """Show which issues this iteration removed (and any new ones it exposed)."""
+    before_keys = {issue_key(i) for i in before}
+    after_keys = {issue_key(i) for i in after}
+    resolved = sorted(before_keys - after_keys)
+    appeared = sorted(after_keys - before_keys)
+    print(f"  --- iteration delta: {len(resolved)} resolved, {len(appeared)} newly exposed ---")
+    for key in resolved:
+        print(f"      RESOLVED  {key}")
+    for key in appeared:
+        print(f"      NEW       {key}")
+
+
+def print_tool_result(author: str, name: str, response) -> None:
+    """Pretty-print a tool response; apply_fix gets a before/after row dump."""
+    if name == "apply_fix" and isinstance(response, dict) and "before" in response:
+        pk = f"{response['issue_type']}:{response['primary_key']}"
+        print(f"  [{author}] <- apply_fix {pk}  ({response['rows_changed']} row(s) changed)")
+        for sql in response["sql"]:
+            print(f"                 sql   : {sql}")
+        print(f"                 before: {response['before']}")
+        print(f"                 after : {response['after']}")
+        print(
+            f"                 issues: {response['issues_before']} -> {response['issues_after']}"
+        )
+    else:
+        print(f"  [{author}] <- {name} returned {response}")
+
+
 async def run_loop() -> None:
+    # Imported here (not at module import time) so the credential check in main()
+    # runs before we try to build a model client.
+    from agents.agent import root_agent
+
     session_service = InMemorySessionService()
     await session_service.create_session(
         app_name=APP_NAME, user_id=USER_ID, session_id=SESSION_ID
@@ -78,33 +123,44 @@ async def run_loop() -> None:
 
     iteration = 0
     escalated = False
+    issues_at_start: list[dict] = []
+
     async for event in runner.run_async(
         user_id=USER_ID, session_id=SESSION_ID, new_message=message
     ):
         # A new iteration starts every time the detector speaks up again.
-        if event.author == FIRST_AGENT and iteration == 0:
+        if event.author == FIRST_AGENT and not iteration:
             iteration = 1
             banner(f"ITERATION {iteration}")
+            issues_at_start = detect_issues()["issues"]
+            print_state("BEFORE this iteration", issues_at_start)
 
         # Tool calls / results - the interesting part of the trace.
         for call in event.get_function_calls() or []:
             print(f"  [{event.author}] -> tool {call.name}({dict(call.args or {})})")
         for resp in event.get_function_responses() or []:
-            print(f"  [{event.author}] <- {resp.name} returned {resp.response}")
+            print_tool_result(event.author, resp.name, resp.response)
 
         # Final natural-language output of each agent.
         if event.is_final_response() and event.content and event.content.parts:
             text = "".join(p.text or "" for p in event.content.parts).strip()
             if text:
                 print(f"  [{event.author}] {text}")
-            if event.author == "validator_agent":
-                iteration += 1
-                if not (event.actions and event.actions.escalate):
-                    banner(f"ITERATION {iteration}")
 
         if event.actions and event.actions.escalate:
             escalated = True
             print(f"\n  *** escalate raised by {event.author} - breaking the loop ***")
+
+        # End of a pass: show what this iteration actually changed.
+        if event.author == "validator_agent" and event.is_final_response():
+            issues_now = detect_issues()["issues"]
+            print_state("AFTER this iteration", issues_now)
+            print_diff(issues_at_start, issues_now)
+            if not escalated:
+                iteration += 1
+                banner(f"ITERATION {iteration}")
+                issues_at_start = issues_now
+                print_state("BEFORE this iteration", issues_at_start)
 
     banner("LOOP FINISHED")
     print(f"  iterations run : {min(iteration, root_agent.max_iterations)}")
@@ -112,8 +168,31 @@ async def run_loop() -> None:
 
 
 def main() -> None:
-    if not os.environ.get("GEMINI_API_KEY") and not os.environ.get("GOOGLE_API_KEY"):
-        sys.exit("GEMINI_API_KEY is not set. See README.md -> Setup.")
+    problem = missing_credentials()
+    if problem:
+        sys.exit(f"{problem}  See README.md -> Setup.")
+    print(f"model: {describe_model()}")
+
+    # Fail fast on a model id the endpoint does not serve: the provider answers
+    # such a request with a bare '404 page not found', which looks like a broken
+    # URL and sends you hunting in the wrong place.
+    try:
+        available = config.list_remote_models()
+    except Exception:  # offline / endpoint without a /models route - skip the check
+        available = []
+    if available and config.MODEL_NAME not in available:
+        hint = [m for m in available if config.MODEL_NAME.split("/")[0] in m][:5]
+        sys.exit(
+            f"Model '{config.MODEL_NAME}' is not served by {config.MODEL_PROVIDER}.\n"
+            f"Similar ids: {hint or 'run python check_model.py for the full list'}"
+        )
+    # Same check for the failover list - an invalid fallback surfaces as a
+    # confusing '404 page not found' only *after* the primary model hiccups.
+    bad = [m for m in config.FALLBACK_MODELS if available and m not in available]
+    if bad:
+        sys.exit(f"ADK_FALLBACK_MODELS contains ids this endpoint does not serve: {bad}")
+    if config.FALLBACK_MODELS:
+        print(f"fallbacks: {', '.join(config.FALLBACK_MODELS)}")
 
     banner("STEP 1  seed SQLite (with 4 intentional defects)")
     seed(SQLITE_PATH)
